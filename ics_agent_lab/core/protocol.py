@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -26,11 +28,85 @@ class ManualJsonProtocol:
         skill_docs: str = "(no skills available)",
         memory_docs: str = "(no memory available)",
     ) -> str:
-        # TODO: your system prompt, including protocol and any available tools/skills.
-        return "You are a helpful assistant."
+        return (
+            "You are a very helpful assistant.\n"
+            "You must respond with exactly one JSON object and nothing else.\n"
+            "Do not use Markdown, code fences, commentary, or explanations outside JSON.\n"
+            "\n"
+            "There are only 2 Allowed response shapes:\n"
+            '{"type":"tool_call","name":"tool_name","arguments":{...}}\n'
+            '{"type":"final","content":"final answer for the user"}\n'
+            "\n"
+            "Rules:\n"
+            "- Use tool_call when you need a tool.\n"
+            "- Tool names must match the available tool docs exactly.\n"
+            "- arguments must be a JSON object.\n"
+            "- Use final only when you are done.\n"
+            "- If the user asks for a task-specific workflow, consult the skill docs first.\n"
+            "- If a long-lived fact is needed, consult the memory docs and use memory tools as needed.\n"
+            "\n"
+            "Available tools:\n"
+            f"{tool_docs}\n"
+            "\n"
+            "Available skills:\n"
+            f"{skill_docs}\n"
+            "\n"
+            "Available memories:\n"
+            f"{memory_docs}"
+        )
 
     def parse(self, text: str) -> ParsedMessage | ParseError:
-        raise NotImplementedError("TODO: parse one manual-JSON assistant message.")
+        raw = text.strip()
+        if not raw:
+            return ParseError(raw=text, reason="Empty assistant response.")
+        
+        #* tolerate some cases
+        # the form of "```json{}```"
+        if raw.startswith("```"):
+            fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```\s*$", raw, re.DOTALL)
+            if fenced:
+                raw = fenced.group(1).strip()
+        
+        # pair the brackets
+        candidate_texts = [raw]
+        if raw and not raw.startswith("{"):
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                candidate_texts.append(raw[start : end + 1].strip())
+
+        last_error = "Invalid JSON response."
+        for candidate in candidate_texts:
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                last_error = f"Invalid JSON: {exc.msg}."
+                continue
+
+            if not isinstance(payload, dict):
+                last_error = "Top-level JSON value must be an object."
+                continue
+            
+            # go in the right way
+            kind = payload.get("type")
+            if kind == "tool_call":
+                name = payload.get("name")
+                arguments = payload.get("arguments")
+                if not isinstance(name, str) or not name.strip():
+                    return ParseError(raw=text, reason="tool_call is missing a valid string `name`.")
+                if not isinstance(arguments, dict):
+                    return ParseError(raw=text, reason="tool_call `arguments` must be a JSON object.")
+                return ParsedMessage(kind="tool_call", name=name, arguments=arguments)
+            
+            if kind == "final":
+                content = payload.get("content")
+                if not isinstance(content, str):
+                    return ParseError(raw=text, reason="final `content` must be a string.")
+                return ParsedMessage(kind="final", content=content)
+
+            last_error = "JSON object must have `type` equal to `tool_call` or `final`."
+
+        return ParseError(raw=text, reason=last_error)
 
     def repair_prompt(self, bad_text: str, reason: str) -> str:
         return (

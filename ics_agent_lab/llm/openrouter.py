@@ -90,6 +90,7 @@ def normalize_socks_proxy_env() -> None:
     ):
         value = os.environ.get(key)
         if value and value.startswith("socks://"):
+            print("proxy")
             os.environ[key] = "socks5://" + value.removeprefix("socks://")
 
 
