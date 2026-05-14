@@ -61,6 +61,7 @@ class ManualJsonProtocol:
             return ParseError(raw=text, reason="Empty assistant response.")
         
         #* tolerate some cases
+        # TODO: are there more efficient ways?
         # the form of "```json{}```"
         if raw.startswith("```"):
             fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```\s*$", raw, re.DOTALL)

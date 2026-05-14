@@ -69,6 +69,14 @@ class Agent:
             }
         )
 
+        # TODO: compress happens here, use user or assistant?
+        # compress according to total message count (including assistant/tool messages).
+        # Note: repair prompts are also 'user' role; counting raw message count avoids
+        # misclassifying internal repair prompts as additional user rounds.
+        if len(messages) > self.config.compact_after_messages:
+            messages = self.compact_context(messages)
+
+
         parse_repairs_used = 0
 
         for step in range(self.config.max_steps):
@@ -112,6 +120,8 @@ class Agent:
                 # run the tool
                 tool_name = parsed_res.name or ""
                 tool_arguments = parsed_res.arguments or {}
+
+                #TODO the interface of tools has not finished yet
                 tool_result = self.tools.run(tool_name, tool_arguments)
 
                 if len(tool_result) > self.config.tool_result_limit:
@@ -145,7 +155,8 @@ class Agent:
                 self.trace.add(step, "final", agent=self.name, content=final_content)
                 messages.append({"role": "assistant", "content": response})
                 return final_content
-
+            
+            # this will never happen
             fallback = "The assistant produced an unsupported protocol message."
             self.trace.add(step, "final", agent=self.name, content=fallback)
             return fallback
@@ -153,3 +164,99 @@ class Agent:
         fallback = "Agent stopped after reaching the maximum number of steps."
         self.trace.add(self.config.max_steps, "final", agent=self.name, content=fallback)
         return fallback
+    
+
+    def compact_context(self, messages: list[Message]) -> list[Message]:
+        """Compact old messages into a short summary and keep recent messages.
+
+        Returns a new messages list where messages earlier than the last
+        `compact_recent_messages` are replaced by a single `system` summary
+        message. Records a `context_compacted` trace event.
+        """
+        # Determine how many recent messages to keep (preserve roles and order)
+        keep = max(0, int(self.config.compact_recent_messages))
+
+        if len(messages) <= 1 + keep:
+            # only system prompt + recent messages present, nothing to compact
+            return messages
+
+        # Keep the original system prompt at index 0
+        system_msg = messages[0]
+
+        recent_msgs = messages[-keep:] if keep > 0 else []
+        old_msgs = messages[1 : len(messages) - keep] if keep > 0 else messages[1:]
+
+        # Build a single text block from old messages for summarization
+        def render(msg: Message) -> str:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            return f"[{role}] {content}"
+
+        old_text = "\n\n".join(render(m) for m in old_msgs)
+        if not old_text.strip():
+            # no need to 
+            return messages
+        
+
+
+        recent_text = "\n\n".join(render(m) for m in recent_msgs)
+        if not recent_text.strip():
+            #TODO should raise error here
+            return messages
+        
+
+
+        # Prompt the LLM to produce a compact summary. Use a messages list so the
+        # transport receives structured role/content data (compatible with LLMTransport).
+        instruct = (
+            "You are a conversation compaction assistant. Compress the provided OLD "
+            "conversation history into a short, factual bulleted summary.\n\n"
+            "CRITICAL RULES:\n"
+            "1) DO NOT summarize the RECENT conversation. It is provided only for context.\n"
+            "2) DO NOT add any new facts, reasoning, or responses — only extract explicit facts.\n"
+            "3) Focus on outstanding tasks, key results (tool outputs, IDs, file paths), and user preferences.\n"
+            "4) Format: concise bulleted list.\n"
+            f"5) Length constraint: aim to keep under {self.config.compact_summary_limit} characters.\n\n"
+        )
+
+        summary_messages = [
+            {"role": "system", "content": instruct},
+            {
+                "role": "user",
+                "content": (
+                    "OLD HISTORY TO COMPRESS:\n" + old_text + "\n\n"
+                    "RECENT HISTORY (for context only - DO NOT SUMMARIZE):\n" + recent_text
+                ),
+            },
+        ]
+
+        try:
+            summary = self.llm.complete(summary_messages) or ""
+        except Exception as exc:  # best-effort: don't break the main loop
+            summary = f"(failed to summarize context: {exc})"
+
+        # Truncate summary if too long
+        if len(summary) > self.config.compact_summary_limit:
+            summary = summary[: self.config.compact_summary_limit] + "..."
+
+        # Build new messages: keep original system prompt, add summary as system,
+        # then append recent messages
+        summary_msg = {
+            "role": "system",
+            "content": "[COMPRESSED HISTORY]\n" + summary,
+        }
+
+        new_messages: list[Message] = [system_msg, summary_msg] + recent_msgs
+
+        # Record trace event
+        self.trace.add(
+            0,
+            "context_compacted",
+            agent=self.name,
+            kept_recent=len(recent_msgs),
+            original_messages=len(messages) - 1,
+            summary_length=len(summary),
+            summary_preview=(summary[:200] + "...") if len(summary) > 200 else summary,
+        )
+
+        return new_messages
