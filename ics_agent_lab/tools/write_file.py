@@ -11,7 +11,11 @@ def make_tool(workspace: Workspace) -> Tool:
         path = arguments.get("path", "")
         content = arguments.get("content", "")
 
-        target = workspace.resolve(path)
+        try:
+            target = workspace.resolve(path)
+        except ValueError as exc:
+            return json_result(ok=False, error=str(exc))
+
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
 

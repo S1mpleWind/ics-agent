@@ -11,7 +11,11 @@ def make_tool(workspace: Workspace) -> Tool:
         path = arguments.get("path", "")
         limit = arguments.get("limit")
 
-        target = workspace.resolve(path)
+        try:
+            target = workspace.resolve(path) #TODO: if not in sandbox,
+        except ValueError as exc:
+            return json_result(ok=False, error=str(exc))
+
         if not target.exists() or not target.is_file():
             return json_result(ok=False, error=f"File not found: {path}")
 

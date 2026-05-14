@@ -22,10 +22,12 @@ class Tool:
         )
 
 
+# sandbox, 
 @dataclass(frozen=True)
 class Workspace:
     root: Path
 
+    # make sure the path exist
     def __post_init__(self) -> None:
         self.root.resolve().mkdir(parents=True, exist_ok=True)
 
@@ -36,6 +38,8 @@ class Workspace:
     def resolve(self, path: str) -> Path:
         root = self.resolved_root
         candidate = (root / path).resolve()
+
+        # prevent escaping
         if root not in candidate.parents and candidate != root:
             raise ValueError("Path escapes lab workspace.")
         return candidate

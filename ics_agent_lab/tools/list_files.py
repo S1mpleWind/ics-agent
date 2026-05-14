@@ -9,7 +9,10 @@ def make_tool(workspace: Workspace) -> Tool:
 
     def handler(arguments: dict[str, Any]) -> str:
         path = arguments.get("path", "")
-        target = workspace.resolve(path)
+        try:
+            target = workspace.resolve(path)
+        except ValueError as exc:
+            return json_result(ok=False, error=str(exc))
 
         if not target.exists():
             return json_result(ok=False, error=f"Path not found: {path}")

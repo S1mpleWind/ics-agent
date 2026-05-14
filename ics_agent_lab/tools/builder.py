@@ -23,6 +23,8 @@ def build_default_tools(
     memory_loader: MemoryLoader | None = None,
     extra_tool_dirs: tuple[Path, ...] = (),
 ) -> ToolRegistry:
+    
+    # create workspace, register tools, pass context to maketool()
     workspace_context = Workspace(workspace)
     registry = ToolRegistry()
     context = {

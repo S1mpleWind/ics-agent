@@ -12,7 +12,11 @@ def make_tool(workspace: Workspace) -> Tool:
         old_text = arguments.get("old_text", "")
         new_text = arguments.get("new_text", "")
 
-        target = workspace.resolve(path)
+        try:
+            target = workspace.resolve(path)
+        except ValueError as exc:
+            return json_result(ok=False, error=str(exc))
+
         if not target.exists() or not target.is_file():
             return json_result(ok=False, error=f"File not found: {path}")
 
