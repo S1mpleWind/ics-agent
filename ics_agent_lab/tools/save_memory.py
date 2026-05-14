@@ -12,8 +12,15 @@ def make_tool(memory_loader: MemoryLoader | None) -> Tool:
         if memory_loader is None:
             return json_result(ok=False, error="Memory loader is not configured.")
 
-        # TODO: save memory
-        return json_result(ok=False, key=None, content="Not implemented yet.")
+        key = arguments.get("key", "")
+        content = arguments.get("content", "")
+
+        try:
+            saved = memory_loader.save(key, content)
+        except Exception as exc:
+            return json_result(ok=False, error=str(exc))
+
+        return json_result(ok=True, key=saved.key, content=saved.content)
 
     return Tool(
         name="save_memory",

@@ -8,9 +8,23 @@ from .base import Tool, Workspace, json_result
 def make_tool(workspace: Workspace) -> Tool:
 
     def handler(arguments: dict[str, Any]) -> str:
-        # TODO: resolve the directory inside the workspace and return a stable,
-        # recursive file listing relative to the workspace root.
-        return json_result(ok=False, error="TODO: implement list_files")
+        path = arguments.get("path", "")
+        target = workspace.resolve(path)
+
+        if not target.exists():
+            return json_result(ok=False, error=f"Path not found: {path}")
+
+        root = workspace.resolved_root
+        files: list[str] = []
+        if target.is_file():
+            files.append(target.relative_to(root).as_posix())
+        else:
+            # Stable order keeps tool output deterministic for evals.
+            for child in sorted(target.rglob("*")):
+                if child.is_file():
+                    files.append(child.relative_to(root).as_posix())
+
+        return json_result(ok=True, path=target.relative_to(root).as_posix(), files=files)
 
     return Tool(
         name="list_files",

@@ -12,8 +12,16 @@ def make_tool(skill_loader: SkillLoader | None) -> Tool:
         if skill_loader is None:
             return json_result(ok=False, error="Skill loader is not configured.")
 
-        # TODO: load the requested skill body from skills/<name>/SKILL.md.
-        return json_result(ok=False, error="TODO: implement load_skill")
+        name = arguments.get("name", "").strip()
+        if not name:
+            return json_result(ok=False, error="`name` must be a non-empty string.")
+
+        try:
+            content = skill_loader.content(name)
+        except Exception as exc:
+            return json_result(ok=False, error=str(exc))
+
+        return json_result(ok=True, name=name, content=content)
 
     return Tool(
         name="load_skill",

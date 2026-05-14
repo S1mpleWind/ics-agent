@@ -8,8 +8,14 @@ from .base import Tool, Workspace, json_result
 def make_tool(workspace: Workspace) -> Tool:
 
     def handler(arguments: dict[str, Any]) -> str:
-        # TODO: resolve the destination path inside the workspace and write the content.
-        return json_result(ok=False, error="TODO: implement write_file")
+        path = arguments.get("path", "")
+        content = arguments.get("content", "")
+
+        target = workspace.resolve(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+        return json_result(ok=True, path=str(target.relative_to(workspace.resolved_root)))
 
     return Tool(
         name="write_file",
