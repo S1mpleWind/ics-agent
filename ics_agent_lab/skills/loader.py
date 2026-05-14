@@ -54,6 +54,13 @@ class SkillLoader:
         return Skill(name=name, description=description, body=body, path=path)
 
     def _parse_frontmatter(self, body: str, path: Path) -> tuple[str, str]:
+        """
+        standard frontmatter form: 
+            ---
+            name:
+            description:
+            ---
+        """
         lines = body.splitlines()
         if len(lines) < 3 or lines[0].strip() != "---":
             raise ValueError(f"Missing front matter in {path}")
@@ -68,8 +75,10 @@ class SkillLoader:
             raise ValueError(f"Unterminated front matter in {path}")
 
         frontmatter = "\n".join(lines[1:end_index])
+
         name_match = re.search(r"^name:\s*(.+)$", frontmatter, re.MULTILINE)
         description_match = re.search(r"^description:\s*(.+)$", frontmatter, re.MULTILINE)
+        
         if name_match is None or description_match is None:
             raise ValueError(f"Front matter must contain name and description in {path}")
 
