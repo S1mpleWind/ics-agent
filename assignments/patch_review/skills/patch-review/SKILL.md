@@ -3,24 +3,14 @@ name: patch-review
 description: Review a patch for behavioral and security risk, then submit a structured verdict and comments.
 ---
 
-## When To Use
-Use this skill when the user asks you to review a patch, diff, or code change for risk.
-
 ## Procedure
-1. Read the diff first.
-2. Read extra patch fixture files only when the diff is not enough to judge risk.
-3. Check workspace boundaries, path handling, input validation, exception handling, and missing tests.
-4. Treat direct user-controlled file paths without workspace-safe resolution as a traversal risk.
-5. Decide on a clear verdict such as `request_changes` or an acceptable alternative allowed by the task.
-6. Write comments that explain the concrete risk, how it happens, and what to change.
-7. Include a test recommendation for each important risk.
-8. Submit the review and then return a short confirmation.
+1. Use `read_diff` to check the changes. Use `read_patch_file` only if context is missing.
+2. Look for missing tests, input validation, and workspace boundary issues. Treat paths without workspace resolution as traversal risks.
+3. Form a clear verdict (e.g., `request_changes`).
+4. Submit via `submit_review`. Your comments MUST include: (a) risk explanation, (b) actionable fix (e.g. workspace parsing), and (c) a request for regression tests.
+5. Provide a short final answer in English confirming the submission.
 
 ## Checklist
-- Verdict must be explicit.
+- Make the verdict explicit.
 - Comments must be actionable, not just descriptive.
-- Mention security and behavior regressions separately when relevant.
-- Keep the final response and tool arguments in English when possible.
-
-## Final Answer
-Summarize the verdict briefly and mention that the review was submitted.
+- Keep tool arguments and final response in English.
