@@ -4,22 +4,17 @@ description: Redact sensitive ticket data, preserve troubleshooting context, val
 ---
 
 ## When To Use
-Use this skill when the user asks to redact a support ticket or any incident report that may contain secrets or personal data.
+Use this skill to redact support tickets containing secrets or personal data, while keeping operational clues.
 
 ## Procedure
-1. Read the original ticket first.
-2. Identify sensitive values such as email addresses, phone numbers, student IDs, access tokens, and private/internal IPs.
-3. Replace sensitive values with placeholders, but keep the troubleshooting story intact.
-4. Preserve the error symptoms, reproduction steps, system state, and any exact file or service names that help debugging.
-5. Call the validation tool before submitting.
-6. If validation reports issues, revise the text and validate again.
-7. Submit only after the redacted text passes validation.
+1. Call the `read_ticket` tool with `ticket_id`.
+2. Replace sensitive values (emails, phones, student IDs, tokens, private IPs) with exact placeholders (e.g., `<EMAIL>`, `<PHONE>`, `<STUDENT_ID>`, `<TOKEN>`, `<PRIVATE_IP>`).
+3. Carefully preserve the troubleshooting context, including error symptoms, reproduction steps, system state, and filenames.
+4. Call the `validate_redaction` tool with the new `content`.
+5. If the checklist is not empty, fix the remaining issues and validate again.
+6. Once validation passes, call `submit_redacted_ticket` with `ticket_id` and the final `content`.
 
 ## Checklist
-- Do not remove important incident context just because it looks sensitive.
 - Do not leave partial secrets behind.
-- Prefer clear placeholders like `<EMAIL>`, `<PHONE>`, `<STUDENT_ID>`, `<TOKEN>`, or `<PRIVATE_IP>`.
-- Keep the final response and tool arguments in English when possible.
-
-## Final Answer
-State briefly that the redacted ticket was submitted successfully.
+- Do not remove important context just because it looks sensitive.
+- Keep final response in English.
