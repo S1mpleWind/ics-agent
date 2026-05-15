@@ -6,6 +6,10 @@ from typing import Any
 
 from dotenv import load_dotenv
 from openai import APIStatusError, OpenAI
+import json
+import urllib.request
+import urllib.error
+import urllib.parse
 
 from .base import LLMTransport, Message
 
@@ -49,6 +53,73 @@ class OpenRouterChatTransport(LLMTransport):
             self.seed = int(env_seed)
 
     def complete(self, messages: list[Message]) -> str:
+        # Prefer using configured DeepSeek API if available; otherwise fall
+        # back to the existing OpenRouter/OpenAI client behavior.
+        ds_api_key = os.environ.get("DEEPSEEK_API_KEY")
+        ds_base = os.environ.get("DEEPSEEK_BASE_URL")
+        ds_model = os.environ.get("DS_MODLE_ID") or os.environ.get("DEEPSEEK_MODEL")
+
+        if ds_api_key and ds_base:
+            # Build a minimal DeepSeek-compatible request. We attempt a common
+            # chat completions shape: POST {base}/v1/chat/completions with
+            # {model, messages, temperature}. This is a best-effort adapter;
+            # caller should ensure env vars match the target API.
+            url = ds_base.rstrip("/") + "/v1/chat/completions"
+            payload = {
+                "model": ds_model or self.model,
+                "messages": messages,
+                "temperature": self.temperature,
+            }
+            if self.seed is not None:
+                payload["seed"] = self.seed
+
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {ds_api_key}",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    raw = resp.read().decode("utf-8")
+            except urllib.error.HTTPError as err:
+                # Surface the HTTP error body when available for easier
+                # diagnostics during eval runs.
+                try:
+                    body = err.read().decode("utf-8")
+                except Exception:
+                    body = str(err)
+                raise RuntimeError(f"DeepSeek API error: {err.code} {body}")
+
+            try:
+                j = json.loads(raw)
+            except Exception:
+                # If we can't parse JSON, return raw text.
+                return raw or ""
+
+            # Common response shapes: choices[0].message.content or choices[0].text
+            try:
+                choices = j.get("choices") or []
+                if choices:
+                    first = choices[0]
+                    if isinstance(first.get("message"), dict):
+                        content = first["message"].get("content")
+                    else:
+                        content = first.get("text")
+                else:
+                    content = j.get("text") or j.get("content")
+            except Exception:
+                content = None
+
+            # Attempt to populate last_usage if the service returns usage
+            self.last_usage = usage_to_dict(j.get("usage") or {})
+            return content or ""
+
+        # Fallback: original OpenRouter/OpenAI flow
         api_key = os.environ.get(self.api_key_env)
         if not api_key:
             raise RuntimeError(
@@ -75,6 +146,35 @@ class OpenRouterChatTransport(LLMTransport):
         content = response.choices[0].message.content
         self.last_usage = usage_to_dict(getattr(response, "usage", None))
         return content or ""
+    
+
+    # def complete(self, messages: list[Message]) -> str:
+    #     api_key = os.environ.get(self.api_key_env)
+    #     if not api_key:
+    #         raise RuntimeError(
+    #             f"Missing {self.api_key_env}. Put it in .env or export it."
+    #         )
+
+    #     client = OpenAI(api_key=api_key, base_url=self.base_url)
+    #     request = {
+    #         "model": self.model,
+    #         "messages": messages,
+    #         "temperature": self.temperature,
+    #     }
+    #     if self.seed is not None:
+    #         request["seed"] = self.seed
+
+    #     try:
+    #         response = client.chat.completions.create(**request)
+    #     except APIStatusError as error:
+    #         if error.status_code != 404 or self.model == self.fallback_model:
+    #             raise
+    #         request["model"] = self.fallback_model
+    #         response = client.chat.completions.create(**request)
+
+    #     content = response.choices[0].message.content
+    #     self.last_usage = usage_to_dict(getattr(response, "usage", None))
+    #     return content or ""
 
 
 def normalize_socks_proxy_env() -> None:

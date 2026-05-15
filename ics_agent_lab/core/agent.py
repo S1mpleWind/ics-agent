@@ -52,6 +52,11 @@ class Agent:
         return self.run_turn(messages, user_input)
 
     def new_session(self) -> list[Message]:
+        loader = MemoryLoader.current()
+        if loader is not None:
+            loader.reload()
+            self.memory_docs = loader.descriptions()
+
         return [
             {
                 "role": "system",
@@ -121,8 +126,16 @@ class Agent:
                 tool_name = parsed_res.name or ""
                 tool_arguments = parsed_res.arguments or {}
 
-                #TODO the interface of tools has not finished yet
-                tool_result = self.tools.run(tool_name, tool_arguments)
+                #TODO reload memory after writing mem? no need to 
+                raw_tool_result = self.tools.run(tool_name, tool_arguments)
+
+                # if tool_name == "save_memory":
+                #     self.memory_docs=MemoryLoader.reload()
+
+                # Record memory-specific events from raw JSON before truncation.
+                self._record_memory_trace(step, tool_name, raw_tool_result)
+
+                tool_result = raw_tool_result
 
                 if len(tool_result) > self.config.tool_result_limit:
                     tool_result = tool_result[: self.config.tool_result_limit] + "..."
@@ -164,6 +177,37 @@ class Agent:
         fallback = "Agent stopped after reaching the maximum number of steps."
         self.trace.add(self.config.max_steps, "final", agent=self.name, content=fallback)
         return fallback
+
+    def _record_memory_trace(self, step: int, tool_name: str, tool_result: str) -> None:
+        """Emit memory trace events without bloating trace payload size.
+
+        Memory evals expect explicit read/write events. We only record minimal
+        metadata (key and success) and avoid writing full memory body content.
+        """
+        if tool_name not in {"read_memory", "save_memory"}:
+            return
+
+        payload = self._parse_tool_json(tool_result)
+        if not isinstance(payload, dict):
+            return
+        if payload.get("ok") is not True:
+            return
+
+        key = payload.get("key")
+        if not isinstance(key, str) or not key.strip():
+            return
+
+        event = "memory_retrieve" if tool_name == "read_memory" else "memory_write"
+        self.trace.add(step, event, agent=self.name, key=key)
+
+    def _parse_tool_json(self, text: str) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
     
 
     def compact_context(self, messages: list[Message]) -> list[Message]:
