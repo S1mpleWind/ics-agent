@@ -17,6 +17,8 @@ def make_tool(memory_loader: MemoryLoader | None) -> Tool:
 
         try:
             saved = memory_loader.save(key, content)
+            # Re-read from disk to guarantee consistency for subsequent reads.
+            memory_loader.reload()
         except Exception as exc:
             return json_result(ok=False, error=str(exc))
 

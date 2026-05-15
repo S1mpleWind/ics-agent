@@ -17,6 +17,9 @@ def make_tool(memory_loader: MemoryLoader | None) -> Tool:
             return json_result(ok=False, error="`key` must be a non-empty string.")
 
         try:
+            # Refresh from disk before each read so independent sessions or
+            # external writes are visible even when runtime wiring is fixed.
+            memory_loader.reload()
             content = memory_loader.content(key)
         except Exception as exc:
             return json_result(ok=False, error=str(exc))

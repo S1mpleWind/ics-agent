@@ -28,9 +28,18 @@ class MemoryLoader:
     on every call.
     """
 
+    _current: "MemoryLoader | None" = None
+
     def __init__(self, memory_dir: Path) -> None:
+        #print("initing ....")
         self.memory_dir = memory_dir
+        MemoryLoader._current = self
         self.reload()
+
+    # TODO: because /runtime is not allowed to be modified
+    @classmethod
+    def current(cls) -> "MemoryLoader | None":
+        return cls._current
 
     def reload(self) -> None:
         """Re-scan the memory directory and rebuild the key index.
@@ -43,7 +52,18 @@ class MemoryLoader:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self._memories_by_key: dict[str, Memory] = {}
 
-        for path in sorted(self.memory_dir.glob("*.md")):
+        #print("reloading")
+        #print(self.memory_dir)
+
+        for path in sorted(
+            (
+                p
+                for p in self.memory_dir.rglob("*")
+                if p.is_file() and p.suffix == ".md"
+            ),
+            key=lambda p: str(p),
+        ):
+            #print(f"reloading{path}")
             memory = self._load_memory_file(path)
             if memory is None:
                 continue
@@ -77,8 +97,14 @@ class MemoryLoader:
         """
 
         key = self._normalize_key(key)
-        memory = self._memories_by_key.get(key)
+        resolved_key = self._resolve_key(key)
+        memory = self._memories_by_key.get(resolved_key) if resolved_key else None
         if memory is None:
+            available = ", ".join(sorted(self._memories_by_key))
+            if available:
+                raise FileNotFoundError(
+                    f"Memory not found: {key}. Available keys: {available}"
+                )
             raise FileNotFoundError(f"Memory not found: {key}")
         return memory.content
 
@@ -102,6 +128,10 @@ class MemoryLoader:
         existing = self._memories_by_key.get(key)
         path = existing.path if existing is not None else self._memory_path_for_key(key)
 
+        # print(path)
+        # print(key)
+        # print(content)
+
         # The on-disk format is intentionally simple:
         #   line 1: the memory key
         #   line 2: blank separator
@@ -112,6 +142,7 @@ class MemoryLoader:
 
         memory = Memory(key=key, content=content, path=path)
         self._memories_by_key[key] = memory
+        #print(self._memories_by_key)
         return memory
 
     def keys(self) -> list[str]:
@@ -123,6 +154,38 @@ class MemoryLoader:
         """Trim whitespace and enforce a non-empty exact key."""
 
         return key.strip()
+
+    def _resolve_key(self, key: str) -> str | None:
+        """Resolve an exact or near-exact key to a stored memory key.
+
+        The public interface still treats keys as stable identifiers, but this
+        fallback makes the store more forgiving when the model uses a short
+        natural-language alias such as "project" for "current_project".
+        Exact matches always win; fuzzy matching only applies when it produces a
+        single unambiguous candidate.
+        """
+
+        if key in self._memories_by_key:
+            return key
+
+        lower_key = key.lower()
+        exact_case_insensitive = [
+            stored_key
+            for stored_key in self._memories_by_key
+            if stored_key.lower() == lower_key
+        ]
+        if len(exact_case_insensitive) == 1:
+            return exact_case_insensitive[0]
+
+        substring_matches = [
+            stored_key
+            for stored_key in self._memories_by_key
+            if lower_key and lower_key in stored_key.lower()
+        ]
+        if len(substring_matches) == 1:
+            return substring_matches[0]
+
+        return None
 
     def _memory_path_for_key(self, key: str) -> Path:
         """Derive a stable, filesystem-safe filename from a memory key.
@@ -146,15 +209,19 @@ class MemoryLoader:
 
         try:
             raw = path.read_text(encoding="utf-8")
+            #print("raw")
         except OSError:
+            print("OS error")
             return None
 
         lines = raw.splitlines()
         if not lines:
+            print("no lines")
             return None
 
         key = _parse_title_line(lines[0])
         if not key:
+            print("no key")
             return None
 
         # Everything after the first line is the stored body. We strip only the
