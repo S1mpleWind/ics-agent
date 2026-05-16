@@ -20,6 +20,8 @@ class AgentConfig:
     compact_recent_messages: int = 4
     compact_summary_limit: int = 12000
     tool_result_limit: int = 6000
+    # Add a token estimation threshold for aggressive compaction
+    estimated_token_limit: int = 3500
 
 
 class Agent:
@@ -78,8 +80,22 @@ class Agent:
         # compress according to total message count (including assistant/tool messages).
         # Note: repair prompts are also 'user' role; counting raw message count avoids
         # misclassifying internal repair prompts as additional user rounds.
-        if len(messages) > self.config.compact_after_messages:
-            messages = self.compact_context(messages)
+        # Determine if we should compact based on message count OR token estimation
+        def estimate_tokens(msgs: list[Message]) -> int:
+            return sum(len(str(m.get("content", ""))) // 4 for m in msgs)
+
+        num_msgs = len(messages)
+        est_tokens = estimate_tokens(messages)
+
+        should_compact = (
+            num_msgs > self.config.compact_after_messages or 
+            est_tokens > self.config.estimated_token_limit
+        )
+
+        if not should_compact:
+            return
+
+        messages = self.compact_context(messages)
 
 
         parse_repairs_used = 0

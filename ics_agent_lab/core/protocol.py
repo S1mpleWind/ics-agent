@@ -25,16 +25,15 @@ class ManualJsonProtocol:
     def build_system_prompt(
         self,
         tool_docs: str,
-        skill_docs: str = "(no skills available)",
-        memory_docs: str = "(no memory available)",
+        skill_docs: str = "(none)",
+        memory_docs: str = "(none)",
     ) -> str:
         return (
             "You are a very helpful assistant.\n"
-            "You must respond with exactly one JSON object and nothing else.\n"
-            "Do not use Markdown, code fences, commentary, or explanations outside JSON.\n"
+            "Respond with exactly one JSON object only, no  Markdown, code fences, commentary etc outside JSON.\n"
             "\n"
-            "There are only 2 Allowed response shapes:\n"
-            '{"type":"tool_call","name":"tool_name","arguments":{...}}\n'
+            "2 Allowed response shapes:\n"
+            '{"type":"tool_call","name":"tool_name","arguments":{k:v}}\n'
             '{"type":"final","content":"final answer for the user"}\n'
             "\n"
             "Rules:\n"
