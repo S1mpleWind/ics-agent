@@ -59,7 +59,9 @@ class OpenRouterChatTransport(LLMTransport):
         ds_base = os.environ.get("DEEPSEEK_BASE_URL")
         ds_model = os.environ.get("DS_MODLE_ID") or os.environ.get("DEEPSEEK_MODEL")
 
-        if ds_api_key and ds_base:
+        use_ds = False
+
+        if ds_api_key and ds_base and use_ds:
             # Build a minimal DeepSeek-compatible request. We attempt a common
             # chat completions shape: POST {base}/v1/chat/completions with
             # {model, messages, temperature}. This is a best-effort adapter;
