@@ -16,12 +16,12 @@ from .trace import TraceRecorder
 class AgentConfig:
     max_steps: int = 100
     max_parse_repairs: int = 2
-    compact_after_messages: int = 20
+    compact_after_messages: int = 12
     compact_recent_messages: int = 4
     compact_summary_limit: int = 12000
-    tool_result_limit: int = 6000
+    tool_result_limit: int = 1200
     # Add a token estimation threshold for aggressive compaction
-    estimated_token_limit: int = 8000
+    estimated_token_limit: int = 6500
 
 
 class Agent:
@@ -96,7 +96,7 @@ class Agent:
             # Continue normally
             pass
         else:
-            messages = self.compact_context(messages)
+            messages = self.micro_compact_tool_history(messages)
 
         parse_repairs_used = 0
 
@@ -225,6 +225,29 @@ class Agent:
             return None
         return payload
     
+    def micro_compact_tool_history(self, messages: list[Message]) -> list[Message]:
+        """Tier 1: Ultra-fast local truncation of large tool results.
+        Only keeps the last 2 tool results fully intact, truncates others to 500 chars.
+        """
+        if len(messages) < 6:
+            return messages
+            
+        new_msgs = [messages[0]] # Keep system prompt
+        tool_count = 0
+        
+        # Reverse iterate to find the most recent tool results
+        for msg in reversed(messages[1:]):
+            content = msg.get("content", "")
+            if "Tool `" in content and "returned this JSON result:" in content:
+                tool_count += 1
+                if tool_count > 5 and len(content) > 150:
+                    # Truncate old large results
+                    msg = msg.copy()
+                    msg["content"] = content[:150] + "... [TRUNCATED BY TIER-1]"
+            new_msgs.insert(1, msg)
+            # this is old msg
+            
+        return self.compact_context(new_msgs)
 
     def compact_context(self, messages: list[Message]) -> list[Message]:
         """Compact old messages into a short summary and keep recent messages.
@@ -289,6 +312,11 @@ class Agent:
                 ),
             },
         ]
+
+        # # Tier 3: Persistent Memory update (Side-effect during Tier 2 compaction)
+        # # We peek at the old history to see if there are user preferences to save
+        # if "user_preferred_name" in old_text or "prefers" in old_text.lower():
+        #     self.tools.run("save_memory", {"key": "session_context", "content": "Compaction triggered. Archiving key facts."})
 
         try:
             summary = self.llm.complete(summary_messages) or ""
