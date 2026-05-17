@@ -18,13 +18,16 @@ class AgentConfig:
     max_steps: int = 100
     max_parse_repairs: int = 2
     tool_history_compact_after_tool_calls: int = 6
-    compact_after_messages: int = 15
+    compact_after_messages: int = 12
     compact_recent_messages: int = 5
-    compact_summary_limit: int = 8000
+    compact_summary_limit: int = 6000
     tool_result_limit: int = 6000
-    estimated_token_limit: int = 18000
+    estimated_token_limit: int = 16000
+    llm_compact_high_water: int = 18000
+    llm_compact_low_water: int = 9000
+    llm_compact_cooldown_steps: int = 7
     # Non-LLM compaction options
-    use_non_llm_compact: bool = False
+    use_non_llm_compact: bool = True
     non_llm_compact_snippet_len: int = 200
 
 
@@ -79,6 +82,7 @@ class Agent:
             return sum(len(str(m.get("content", ""))) // 4 for m in msgs)
 
         parse_repairs_used = 0
+        last_llm_compact_step = -10**9
         for step in range(self.config.max_steps):
             num_msgs = len(messages)
             est_tokens = estimate_tokens(messages)
@@ -86,13 +90,12 @@ class Agent:
             if self._should_micro_compact(messages):
                 messages = self.micro_compact_tool_history(messages, est_tokens)
 
-            #TODO: here
-            # # choose compaction path: prefer non-LLM compact when configured
-            # if self._should_llm_compact(messages, num_msgs, est_tokens):
-            #     if getattr(self.config, "use_non_llm_compact", False):
-            #         messages = self.compact_context_nonllm(messages, est_tokens)
-            #     else:
-            #         messages = self.compact_context(messages, est_tokens)
+            # if self._should_non_llm_compact(messages, num_msgs, est_tokens):
+            #     messages = self.compact_context_nonllm(messages, est_tokens)
+
+            if self._should_llm_compact(messages, num_msgs, est_tokens, step, last_llm_compact_step):
+                messages = self.compact_context(messages, est_tokens)
+                last_llm_compact_step = step
 
             response = self.llm.complete(messages)
             self.trace.add(step, "llm_response", agent=self.name, raw=response)
@@ -171,10 +174,10 @@ class Agent:
                 if (
                     not should_preserve_recent
                     and tool_count > self.config.tool_history_compact_after_tool_calls
-                    and len(content) > 450
+                    and len(content) > 400
                 ):
                     msg = msg.copy()
-                    msg["content"] = content[:400] + "... [Old tool output cleared to save context space]"
+                    msg["content"] = content[:350] + "... [Old tool output cleared to save context space]"
                     truncated_count += 1
             new_msgs.insert(1, msg)
 
@@ -192,7 +195,7 @@ class Agent:
     def compact_context(self, messages: list[Message], estimate:int) -> list[Message]:
         #summary_char_limit = min(int(self.config.compact_summary_limit), max(2000, estimate * 2))
 
-        max_limit = int(min(self.config.compact_summary_limit,  0.38 * estimate))
+        max_limit = int(min(self.config.compact_summary_limit,  0.3 * estimate))
         min_limit = int(max(2000, estimate * 0.2))
 
         keep = max(0, int(self.config.compact_recent_messages))
@@ -226,7 +229,8 @@ class Agent:
         #      pass
 
         instruct = (
-            "Summarize the OLD conversation history as a structured factual list.\n"
+            "You are a summarize export who can summarize the agent context to specific length"
+            "Summarize the OLD conversation history as a structured factual list **Briefly and Precisely**.\n"
             "You MUST preserve:\n"
             "1. Current task goal — what the user originally asked for.\n"
             "2. Key actions taken — tool calls made and their outcomes (OK/Error + critical return values).\n"
@@ -234,7 +238,7 @@ class Agent:
             "4. Decisions and constraints — any explicit choices made, requirements stated, or approaches ruled out.\n"
             "5. Next step — what was about to happen or what remains to be done.\n"
             "Use RECENT_CTX only to avoid repeating what is already there. Do not reproduce RECENT_CTX verbatim.\n"
-            f"Ensure the length of summary is between {min_limit} and {max_limit}\n"
+            f"**Ensure the length of summary is between {min_limit} and {max_limit}\n**"
         )
         summary_messages = [
             {"role": "system", "content": instruct},
@@ -273,13 +277,32 @@ class Agent:
             for msg in messages
         )
 
-    def _should_llm_compact(self, messages: list[Message], num_msgs: int, est_tokens: int) -> bool:
+    def _should_non_llm_compact(self, messages: list[Message], num_msgs: int, est_tokens: int) -> bool:
+        if not getattr(self.config, "use_non_llm_compact", False):
+            return False
+
         keep = max(0, int(self.config.compact_recent_messages))
         if len(messages) <= 1 + keep:
             return False
 
-        # retained_msgs = [msg for msg in messages[1:] if not self._is_history_summary_message(msg)]
-        if len(messages) <= keep:
+        return (
+            num_msgs >= self.config.compact_after_messages
+            or est_tokens >= self.config.estimated_token_limit
+        )
+
+    def _should_llm_compact(
+        self,
+        messages: list[Message],
+        num_msgs: int,
+        est_tokens: int,
+        step: int,
+        last_llm_compact_step: int,
+    ) -> bool:
+        keep = max(0, int(self.config.compact_recent_messages))
+        if len(messages) <= 1 + keep:
+            return False
+
+        if step - last_llm_compact_step < max(0, int(self.config.llm_compact_cooldown_steps)):
             return False
 
         recent_msgs = messages[-keep:] if keep > 0 else []
@@ -289,12 +312,14 @@ class Agent:
         recent_tokens = sum(len(str(m.get("content", ""))) // 4 for m in recent_msgs)
 
         if num_msgs >= self.config.compact_after_messages:
+            return old_tokens >= self.config.llm_compact_high_water
+        if est_tokens >= self.config.llm_compact_high_water:
             return True
-        if est_tokens >= self.config.estimated_token_limit:
+        if old_tokens >= self.config.llm_compact_high_water:
             return True
         if old_tokens >= self.config.compact_summary_limit:
-            return True
-        if old_tokens >= max(3000, self.config.estimated_token_limit * 0.6) and old_tokens >= 2 * max(1, recent_tokens):
+            return False
+        if old_tokens >= self.config.llm_compact_low_water and old_tokens >= 2 * max(1, recent_tokens):
             return True
 
         return False
@@ -307,6 +332,8 @@ class Agent:
             and content.startswith("Tool `")
             and "returned this JSON result:" in content
         )
+    
+    #? some aborted functions
 
     # def _is_history_summary_message(self, message: Message) -> bool:
     #     return (

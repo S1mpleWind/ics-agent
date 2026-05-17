@@ -29,17 +29,16 @@ class ManualJsonProtocol:
         memory_docs: str = "(none)",
     ) -> str:
         return (
-            "You are a very helpful assistant.\n"
-            "Respond with exactly one JSON object only, no  Markdown, code fences, commentary etc outside JSON.\n"
+            "You are a helpful assistant.\n"
+            "Respond with exactly one JSON object only, ensure nothing outside JSON.\n"
             "\n"
-            "2 Allowed response shapes:\n"
+            "2 Allowed response template:\n"
             '{"type":"tool_call","name":"tool_name","arguments":{k:v}}\n'
             '{"type":"final","content":"final answer for the user"}\n'
             "\n"
             "Rules:\n"
-            "- Carefully choose and Use tool_call when you need a tool.\n"
-            "- Tool names must match the available tool docs exactly.\n"
-            "- arguments must be a JSON object.\n"
+            "- Carefully choose Tool name from tool docs and Use tool_call when you need a tool.\n"
+            "- Tool arguments must be a JSON object.\n"
             "- Use final only when you are done.\n"
             "- If the user asks for a task-specific workflow, consult the skill docs first and VERY STRICTLY follow its instruction.\n"
             "- If a long-lived fact is needed, consult the memory docs and use memory tools as needed.\n"
