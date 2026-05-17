@@ -21,7 +21,7 @@ class AgentConfig:
     compact_summary_limit: int = 12000
     tool_result_limit: int = 6000
     # Add a token estimation threshold for aggressive compaction
-    estimated_token_limit: int = 3500
+    estimated_token_limit: int = 8000
 
 
 class Agent:
@@ -93,10 +93,10 @@ class Agent:
         )
 
         if not should_compact:
-            return
-
-        messages = self.compact_context(messages)
-
+            # Continue normally
+            pass
+        else:
+            messages = self.compact_context(messages)
 
         parse_repairs_used = 0
 
