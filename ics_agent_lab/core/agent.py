@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,10 +19,13 @@ class AgentConfig:
     max_parse_repairs: int = 2
     tool_history_compact_after_tool_calls: int = 6
     compact_after_messages: int = 15
-    compact_recent_messages: int = 6
-    compact_summary_limit: int = 12000
+    compact_recent_messages: int = 5
+    compact_summary_limit: int = 8000
     tool_result_limit: int = 6000
-    estimated_token_limit: int = 30000
+    estimated_token_limit: int = 18000
+    # Non-LLM compaction options
+    use_non_llm_compact: bool = False
+    non_llm_compact_snippet_len: int = 200
 
 
 class Agent:
@@ -82,8 +86,13 @@ class Agent:
             if self._should_micro_compact(messages):
                 messages = self.micro_compact_tool_history(messages, est_tokens)
 
+            #TODO: here
+            # # choose compaction path: prefer non-LLM compact when configured
             # if self._should_llm_compact(messages, num_msgs, est_tokens):
-            #     messages = self.compact_context(messages, est_tokens)
+            #     if getattr(self.config, "use_non_llm_compact", False):
+            #         messages = self.compact_context_nonllm(messages, est_tokens)
+            #     else:
+            #         messages = self.compact_context(messages, est_tokens)
 
             response = self.llm.complete(messages)
             self.trace.add(step, "llm_response", agent=self.name, raw=response)
@@ -148,7 +157,7 @@ class Agent:
     
     def micro_compact_tool_history(self, messages: list[Message], estimate: int) -> list[Message]:
         """Tier 1: Intelligent local truncation using Tool Registry metadata."""
-        if len(messages) < 6: return messages
+        if len(messages) < int(self.config.compact_recent_messages): return messages
         new_msgs = [messages[0]]
         tool_count = 0
         truncated_count = 0
@@ -162,10 +171,10 @@ class Agent:
                 if (
                     not should_preserve_recent
                     and tool_count > self.config.tool_history_compact_after_tool_calls
-                    and len(content) > 600
+                    and len(content) > 450
                 ):
                     msg = msg.copy()
-                    msg["content"] = content[:500] + "... [Old tool output cleared to save context space]"
+                    msg["content"] = content[:400] + "... [Old tool output cleared to save context space]"
                     truncated_count += 1
             new_msgs.insert(1, msg)
 
@@ -183,7 +192,7 @@ class Agent:
     def compact_context(self, messages: list[Message], estimate:int) -> list[Message]:
         #summary_char_limit = min(int(self.config.compact_summary_limit), max(2000, estimate * 2))
 
-        max_limit = int(min(self.config.compact_summary_limit, max(2000, 0.5 * estimate)))
+        max_limit = int(min(self.config.compact_summary_limit,  0.38 * estimate))
         min_limit = int(max(2000, estimate * 0.2))
 
         keep = max(0, int(self.config.compact_recent_messages))
@@ -217,13 +226,15 @@ class Agent:
         #      pass
 
         instruct = (
-            "Summarize the OLD history as a factual bulleted list.\n"
-            "REQUIREMENTS:\n"
-            "1. KEEP all file paths, function names, and variable definitions.\n"
-            "2. KEEP all tool execution statuses (OK/Error) and critical return values.\n"
-            "3. Use RECENT_CTX only to decide what can be safely omitted from OLD HISTORY.\n"
-            "4. Do not repeat RECENT_CTX verbatim unless it is essential to preserve a fact.\n"
-            f"5. Ensure the length of summary is between {min_limit} and {max_limit}\n"
+            "Summarize the OLD conversation history as a structured factual list.\n"
+            "You MUST preserve:\n"
+            "1. Current task goal — what the user originally asked for.\n"
+            "2. Key actions taken — tool calls made and their outcomes (OK/Error + critical return values).\n"
+            "3. Files and symbols touched — every file path, function name, and variable that was read or modified.\n"
+            "4. Decisions and constraints — any explicit choices made, requirements stated, or approaches ruled out.\n"
+            "5. Next step — what was about to happen or what remains to be done.\n"
+            "Use RECENT_CTX only to avoid repeating what is already there. Do not reproduce RECENT_CTX verbatim.\n"
+            f"Ensure the length of summary is between {min_limit} and {max_limit}\n"
         )
         summary_messages = [
             {"role": "system", "content": instruct},
@@ -249,6 +260,7 @@ class Agent:
 
         self.trace.add(0, "context_compacted", agent=self.name, original_count=len(messages))
         return new_messages
+
 
     def _should_micro_compact(self, messages: list[Message]) -> bool:
         tool_result_count = sum(1 for msg in messages if self._is_tool_result_message(msg))
@@ -302,3 +314,141 @@ class Agent:
     #         and isinstance(message.get("content"), str)
     #         and message["content"].startswith("[HISTORY SUMMARY]")
     #     )
+
+
+    def compact_context_nonllm(self, messages: list[Message], estimate: int) -> list[Message]:
+        """Non-LLM compaction: deterministic, low-cost summarization that
+        extracts key IDs, paths, tool outputs, failures, evidence lines and
+        next-steps without calling an external model.
+        """
+        keep = max(0, int(self.config.compact_recent_messages))
+        if len(messages) <= 1 + keep:
+            return messages
+
+        # base system prompt (clean build)
+        system_msg = messages[0]
+        if isinstance(system_msg, dict):
+            base_system = system_msg.get("content", "")
+        else:
+            base_system = str(system_msg)
+
+        retained = messages[1:]
+        recent_msgs = retained[-keep:] if keep > 0 else []
+        old_msgs = retained[:-keep] if keep > 0 else retained
+
+        key_ids: set[str] = set()
+        paths: set[str] = set()
+        tool_summaries: list[dict[str, Any]] = []
+        failures: list[str] = []
+        evidences: list[str] = []
+        next_steps: list[str] = []
+
+        err_re = re.compile(r"error|failed|exception|traceback|timeout|denied|forbidden|\bok\":\s*false|status:\s*failed", re.I)
+        path_re = re.compile(r"(/[A-Za-z0-9_./\-]+)")
+        id_re = re.compile(r"\b[A-Za-z0-9_-]{8,}\b")
+        next_re = re.compile(r"\b(next steps?|todo|plan|follow up)\b", re.I)
+
+        snippet_len = int(self.config.non_llm_compact_snippet_len)
+
+        for msg in old_msgs:
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            role = msg.get("role", "") if isinstance(msg, dict) else ""
+
+            if self._is_tool_result_message(msg):
+                # try to extract JSON payload from the text
+                parsed = None
+                idx = content.find("{")
+                if idx != -1:
+                    candidate = content[idx:]
+                    try:
+                        parsed = json.loads(candidate)
+                    except Exception:
+                        parsed = None
+
+                info: dict[str, Any] = {
+                    "role": role,
+                    "size": len(content),
+                    "snippet_head": content[:snippet_len],
+                    "snippet_tail": content[-snippet_len:],
+                }
+                if isinstance(parsed, dict):
+                    info["keys"] = list(parsed.keys())[:10]
+                    if "key" in parsed and isinstance(parsed["key"], str):
+                        key_ids.add(parsed["key"])
+                    info["ok"] = parsed.get("ok")
+                tool_summaries.append(info)
+                # evidence may include status-like fields
+                if parsed and isinstance(parsed, dict):
+                    for k, v in parsed.items():
+                        if isinstance(v, str) and len(v) > 0 and path_re.search(v):
+                            paths.add(v)
+
+            else:
+                # free text: scan for failures, paths, ids, next-steps
+                lines = [ln.strip() for ln in str(content).splitlines() if ln.strip()]
+                matched_flag = False
+                for ln in lines:
+                    if err_re.search(ln):
+                        failures.append(ln)
+                        evidences.append(ln)
+                        matched_flag = True
+                    for m in path_re.findall(ln):
+                        paths.add(m)
+                    for iid in id_re.findall(ln):
+                        key_ids.add(iid)
+                    if next_re.search(ln):
+                        next_steps.append(ln)
+                        matched_flag = True
+                if not matched_flag and lines:
+                    # keep a small snippet as evidence
+                    evidences.append(lines[0][:snippet_len])
+
+        parts: list[str] = []
+        # Goal: prefer the first non-empty line of the base system prompt
+        goal = (base_system or "").splitlines()
+        if goal:
+            first_goal = goal[0].strip()
+            if first_goal:
+                parts.append("GOAL: " + first_goal)
+
+        if key_ids:
+            parts.append("KEY_IDS: " + ", ".join(list(key_ids)[:20]))
+        if paths:
+            parts.append("PATHS: " + ", ".join(list(paths)[:20]))
+
+        if failures:
+            parts.append("FAILURES:")
+            for f in failures[:20]:
+                parts.append("- " + f)
+
+        if tool_summaries:
+            parts.append("TOOL_OUTPUTS:")
+            for t in tool_summaries[:50]:
+                keys = t.get("keys") or []
+                parts.append(
+                    "- size={size}, keys={keys}, head={head}...".format(
+                        size=t.get("size"), keys=keys, head=t.get("snippet_head", "")[:120]
+                    )
+                )
+
+        if evidences:
+            parts.append("EVIDENCE:")
+            for e in evidences[:50]:
+                parts.append("- " + e)
+
+        if next_steps:
+            parts.append("NEXT_STEPS:")
+            for n in next_steps[:20]:
+                parts.append("- " + n)
+
+        summary = "\n".join(parts).strip()
+        limit = int(self.config.compact_summary_limit)
+        if len(summary) > limit:
+            summary = summary[: max(0, limit - 3)] + "..."
+
+        new_system_content = "[HISTORY SUMMARY]\n" + summary + "\n\n" + base_system
+        new_system_msg = {"role": "system", "content": new_system_content}
+        new_messages = [new_system_msg] + recent_msgs
+
+        self.trace.add(0, "context_compacted_nonllm", agent=self.name, original_count=len(messages), retained_recent=len(recent_msgs))
+        return new_messages
