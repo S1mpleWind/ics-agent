@@ -21,10 +21,10 @@ class AgentConfig:
     compact_after_messages: int = 12
     compact_recent_messages: int = 5
     compact_summary_limit: int = 6000
-    tool_result_limit: int = 6000
+    tool_result_limit: int = 5800
     estimated_token_limit: int = 16000
     llm_compact_high_water: int = 18000
-    llm_compact_low_water: int = 9000
+    llm_compact_low_water: int = 9800
     llm_compact_cooldown_steps: int = 7
     # Non-LLM compaction options
     use_non_llm_compact: bool = True
