@@ -4,7 +4,7 @@ description: Handle a short-lived dispatch token, read the notice immediately, a
 ---
 
 ## Procedure
-1. Call `dispatch_notice_handler` immediately.
+1. Call `dispatch_notice_handler` **once immediately**.
 2. Do not call any other tool or add preamble before the call.
 3. After success, give a very short confirmation.
 

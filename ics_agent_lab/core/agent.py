@@ -16,12 +16,12 @@ from .trace import TraceRecorder
 class AgentConfig:
     max_steps: int = 100
     max_parse_repairs: int = 2
-    compact_after_messages: int = 12
-    compact_recent_messages: int = 4
+    tool_history_compact_after_tool_calls: int = 6
+    compact_after_messages: int = 15
+    compact_recent_messages: int = 6
     compact_summary_limit: int = 12000
-    tool_result_limit: int = 1200
-    # Add a token estimation threshold for aggressive compaction
-    estimated_token_limit: int = 6500
+    tool_result_limit: int = 6000
+    estimated_token_limit: int = 30000
 
 
 class Agent:
@@ -69,114 +69,52 @@ class Agent:
         ]
 
     def run_turn(self, messages: list[Message], user_input: str) -> str:
-        messages.append(
-            {
-                "role": "user",
-                "content": user_input,
-            }
-        )
+        messages.append({"role": "user", "content": user_input})
 
-        # TODO: compress happens here, use user or assistant?
-        # compress according to total message count (including assistant/tool messages).
-        # Note: repair prompts are also 'user' role; counting raw message count avoids
-        # misclassifying internal repair prompts as additional user rounds.
-        # Determine if we should compact based on message count OR token estimation
         def estimate_tokens(msgs: list[Message]) -> int:
             return sum(len(str(m.get("content", ""))) // 4 for m in msgs)
 
-        num_msgs = len(messages)
-        est_tokens = estimate_tokens(messages)
-
-        should_compact = (
-            num_msgs > self.config.compact_after_messages or 
-            est_tokens > self.config.estimated_token_limit
-        )
-
-        if not should_compact:
-            # Continue normally
-            pass
-        else:
-            messages = self.micro_compact_tool_history(messages)
-
         parse_repairs_used = 0
-
         for step in range(self.config.max_steps):
+            num_msgs = len(messages)
+            est_tokens = estimate_tokens(messages)
+
+            if self._should_micro_compact(messages):
+                messages = self.micro_compact_tool_history(messages, est_tokens)
+
+            # if self._should_llm_compact(messages, num_msgs, est_tokens):
+            #     messages = self.compact_context(messages, est_tokens)
+
             response = self.llm.complete(messages)
             self.trace.add(step, "llm_response", agent=self.name, raw=response)
-
             parsed_res = self.protocol.parse(response)
 
-            # error: add info to trace
             if isinstance(parsed_res, ParseError):
-                self.trace.add(
-                    step,
-                    "parse_error",
-                    agent=self.name,
-                    raw=parsed_res.raw,
-                    reason=parsed_res.reason,
-                )
-
+                self.trace.add(step, "parse_error", agent=self.name, raw=parsed_res.raw, reason=parsed_res.reason)
                 if parse_repairs_used >= self.config.max_parse_repairs:
-                    fallback = (
-                        "I could not produce a valid JSON response after several retries."
-                    )
+                    fallback = "I could not produce a valid JSON response after several retries."
                     self.trace.add(step, "final", agent=self.name, content=fallback)
                     return fallback
-
-                # try to repair
                 parse_repairs_used += 1
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": self.protocol.repair_prompt(
-                            parsed_res.raw, parsed_res.reason
-                        ),
-                    }
-                )
+                messages.append({"role": "user", "content": self.protocol.repair_prompt(parsed_res.raw, parsed_res.reason)})
                 continue
             
-            # ParsedMessages:
             if parsed_res.kind == "tool_call":
-
-                # run the tool
                 tool_name = parsed_res.name or ""
                 tool_arguments = parsed_res.arguments or {}
-
-                #TODO reload memory after writing mem? no need to 
                 raw_tool_result = self.tools.run(tool_name, tool_arguments)
-
-                # if tool_name == "save_memory":
-                #     self.memory_docs=MemoryLoader.reload()
-
-                # Record memory-specific events from raw JSON before truncation.
                 self._record_memory_trace(step, tool_name, raw_tool_result)
 
                 tool_result = raw_tool_result
-
                 if len(tool_result) > self.config.tool_result_limit:
                     tool_result = tool_result[: self.config.tool_result_limit] + "..."
 
-                # add the result of tool calling
-                self.trace.add(
-                    step,
-                    "tool_call",
-                    agent=self.name,
-                    name=tool_name,
-                    arguments=tool_arguments,
-                    result=tool_result,
-                )
-                
+                self.trace.add(step, "tool_call", agent=self.name, name=tool_name, arguments=tool_arguments, result=tool_result)
                 messages.append({"role": "assistant", "content": response})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Tool `{tool_name}` returned this JSON result:\n"
-                            f"{tool_result}\n"
-                            "Continue with the protocol and respond with exactly one JSON object."
-                        ),
-                    }
-                )
+                messages.append({
+                    "role": "user",
+                    "content": f"Tool `{tool_name}` returned this JSON result:\n{tool_result}\nContinue with the protocol."
+                })
                 continue
 
             if parsed_res.kind == "final":
@@ -185,166 +123,176 @@ class Agent:
                 messages.append({"role": "assistant", "content": response})
                 return final_content
             
-            # this will never happen
-            fallback = "The assistant produced an unsupported protocol message."
+            fallback = "Unsupported protocol message."
             self.trace.add(step, "final", agent=self.name, content=fallback)
             return fallback
 
-        fallback = "Agent stopped after reaching the maximum number of steps."
+        fallback = "Agent stopped after reaching maximum steps."
         self.trace.add(self.config.max_steps, "final", agent=self.name, content=fallback)
         return fallback
 
     def _record_memory_trace(self, step: int, tool_name: str, tool_result: str) -> None:
-        """Emit memory trace events without bloating trace payload size.
-
-        Memory evals expect explicit read/write events. We only record minimal
-        metadata (key and success) and avoid writing full memory body content.
-        """
-        if tool_name not in {"read_memory", "save_memory"}:
-            return
-
+        if tool_name not in {"read_memory", "save_memory"}: return
         payload = self._parse_tool_json(tool_result)
-        if not isinstance(payload, dict):
-            return
-        if payload.get("ok") is not True:
-            return
-
+        if not isinstance(payload, dict) or payload.get("ok") is not True: return
         key = payload.get("key")
-        if not isinstance(key, str) or not key.strip():
-            return
-
+        if not isinstance(key, str) or not key.strip(): return
         event = "memory_retrieve" if tool_name == "read_memory" else "memory_write"
         self.trace.add(step, event, agent=self.name, key=key)
 
     def _parse_tool_json(self, text: str) -> dict[str, Any] | None:
         try:
             payload = json.loads(text)
-        except Exception:
-            return None
-        if not isinstance(payload, dict):
-            return None
-        return payload
+            return payload if isinstance(payload, dict) else None
+        except: return None
     
-    def micro_compact_tool_history(self, messages: list[Message]) -> list[Message]:
-        """Tier 1: Ultra-fast local truncation of large tool results.
-        Only keeps the last 2 tool results fully intact, truncates others to 500 chars.
-        """
-        if len(messages) < 6:
-            return messages
-            
-        new_msgs = [messages[0]] # Keep system prompt
+    def micro_compact_tool_history(self, messages: list[Message], estimate: int) -> list[Message]:
+        """Tier 1: Intelligent local truncation using Tool Registry metadata."""
+        if len(messages) < 6: return messages
+        new_msgs = [messages[0]]
         tool_count = 0
+        truncated_count = 0
         
-        # Reverse iterate to find the most recent tool results
         for msg in reversed(messages[1:]):
             content = msg.get("content", "")
-            if "Tool `" in content and "returned this JSON result:" in content:
+            if self._is_tool_result_message(msg):
                 tool_count += 1
-                if tool_count > 5 and len(content) > 150:
-                    # Truncate old large results
+                if tool_count > self.config.tool_history_compact_after_tool_calls and len(content) > 300:
                     msg = msg.copy()
-                    msg["content"] = content[:150] + "... [TRUNCATED BY TIER-1]"
+                    msg["content"] = content[:200] + "... [Old tool output cleared to save context space]"
+                    truncated_count += 1
             new_msgs.insert(1, msg)
-            # this is old msg
-            
-        return self.compact_context(new_msgs)
 
-    def compact_context(self, messages: list[Message]) -> list[Message]:
-        """Compact old messages into a short summary and keep recent messages.
+        if truncated_count:
+            self.trace.add(
+                0,
+                "tool_history_compacted",
+                agent=self.name,
+                original_count=len(messages),
+                truncated_count=truncated_count,
+            )
 
-        Returns a new messages list where messages earlier than the last
-        `compact_recent_messages` are replaced by a single `system` summary
-        message. Records a `context_compacted` trace event.
-        """
-        # Determine how many recent messages to keep (preserve roles and order)
+        return new_msgs
+
+    def compact_context(self, messages: list[Message], estimate:int) -> list[Message]:
+        #summary_char_limit = min(int(self.config.compact_summary_limit), max(2000, estimate * 2))
+
+        max_limit = int(min(self.config.compact_summary_limit, max(2000, 0.5 * estimate)))
+        min_limit = int(max(2000, estimate * 0.2))
+
         keep = max(0, int(self.config.compact_recent_messages))
+        if len(messages) <= 1 + keep: return messages
+        # use a clean base system prompt string each time
+        system_prompt_content = self.protocol.build_system_prompt(
+                    self.tools.docs(), self.skill_docs, self.memory_docs)
+        
+        retained_msgs = messages
 
-        if len(messages) <= 1 + keep:
-            # only system prompt + recent messages present, nothing to compact
+        if len(retained_msgs) <= keep:
             return messages
 
-        # Keep the original system prompt at index 0
-        system_msg = messages[0]
+        if keep > 0:
+            recent_msgs = retained_msgs[-keep:]
+            old_msgs = retained_msgs[:-keep]
+        else:
+            recent_msgs = []
+            old_msgs = retained_msgs
 
-        recent_msgs = messages[-keep:] if keep > 0 else []
-        old_msgs = messages[1 : len(messages) - keep] if keep > 0 else messages[1:]
-
-        # Build a single text block from old messages for summarization
         def render(msg: Message) -> str:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            return f"[{role}] {content}"
+            return f"[{msg.get('role', '')}] {msg.get('content', '')}"
 
         old_text = "\n\n".join(render(m) for m in old_msgs)
-        if not old_text.strip():
-            # no need to 
-            return messages
-        
-
-
         recent_text = "\n\n".join(render(m) for m in recent_msgs)
-        if not recent_text.strip():
-            #TODO should raise error here
-            return messages
-        
 
+        # Persistent archival (Tier 3)
+        # Search for any explicit 'save_memory' results in old_text to ensure they are indexed
+        # if "save_memory" in old_text and "ok\": true" in old_text:
+        #      # Logic to re-ensure key facts are archived if relevant
+        #      pass
 
-        # Prompt the LLM to produce a compact summary. Use a messages list so the
-        # transport receives structured role/content data (compatible with LLMTransport).
         instruct = (
-            "You are a conversation compaction assistant. Compress the provided OLD "
-            "conversation history into a short, factual bulleted summary.\n\n"
-            "CRITICAL RULES:\n"
-            "1) DO NOT summarize the RECENT conversation. It is provided only for context.\n"
-            "2) DO NOT add any new facts, reasoning, or responses — only extract explicit facts.\n"
-            "3) Focus on outstanding tasks, key results (tool outputs, IDs, file paths), and user preferences.\n"
-            "4) Format: concise bulleted list.\n"
-            f"5) Length constraint: aim to keep under {self.config.compact_summary_limit} characters.\n\n"
+            "Summarize the OLD history as a factual bulleted list.\n"
+            "REQUIREMENTS:\n"
+            "1. KEEP all file paths, function names, and variable definitions.\n"
+            "2. KEEP all tool execution statuses (OK/Error) and critical return values.\n"
+            "3. Use RECENT_CTX only to decide what can be safely omitted from OLD HISTORY.\n"
+            "4. Do not repeat RECENT_CTX verbatim unless it is essential to preserve a fact.\n"
+            f"5. Ensure the length of summary is between {min_limit} and {max_limit}\n"
         )
-
         summary_messages = [
             {"role": "system", "content": instruct},
-            {
-                "role": "user",
-                "content": (
-                    "OLD HISTORY TO COMPRESS:\n" + old_text + "\n\n"
-                    "RECENT HISTORY (for context only - DO NOT SUMMARIZE):\n" + recent_text
-                ),
-            },
+            {"role": "user", "content": f"OLD HISTORY:\n{old_text}\n\nRECENT_CTX:\n{recent_text}"}
         ]
-
-        # # Tier 3: Persistent Memory update (Side-effect during Tier 2 compaction)
-        # # We peek at the old history to see if there are user preferences to save
-        # if "user_preferred_name" in old_text or "prefers" in old_text.lower():
-        #     self.tools.run("save_memory", {"key": "session_context", "content": "Compaction triggered. Archiving key facts."})
-
         try:
-            summary = self.llm.complete(summary_messages) or ""
-        except Exception as exc:  # best-effort: don't break the main loop
-            summary = f"(failed to summarize context: {exc})"
+            summary = (self.llm.complete(summary_messages) or "").strip()
+            if len(summary) > max_limit:
+                summary = summary[:max_limit].rstrip() + "..."
+        except:
+            summary = "(summary failed)"
 
-        # Truncate summary if too long
-        if len(summary) > self.config.compact_summary_limit:
-            summary = summary[: self.config.compact_summary_limit] + "..."
+        # incorporate the base system prompt into the summary and place the
+        # compressed summary at the beginning of a single system message.
+        base_system = system_prompt_content
+        if isinstance(base_system, str) and "[HISTORY SUMMARY]" in base_system:
+            # remove any prior summary block by keeping the tail after last marker
+            base_system = base_system.split("[HISTORY SUMMARY]")[-1].lstrip()
 
-        # Build new messages: keep original system prompt, add summary as system,
-        # then append recent messages
-        summary_msg = {
-            "role": "system",
-            "content": "[COMPRESSED HISTORY]\n" + summary,
-        }
+        new_system_content = f"[HISTORY SUMMARY]\n{summary}\n\n{base_system}"
+        new_system_msg = {"role": "system", "content": new_system_content}
+        new_messages = [new_system_msg] + recent_msgs
 
-        new_messages: list[Message] = [system_msg, summary_msg] + recent_msgs
+        self.trace.add(0, "context_compacted", agent=self.name, original_count=len(messages))
+        return new_messages
 
-        # Record trace event
-        self.trace.add(
-            0,
-            "context_compacted",
-            agent=self.name,
-            kept_recent=len(recent_msgs),
-            original_messages=len(messages) - 1,
-            summary_length=len(summary),
-            summary_preview=(summary[:200] + "...") if len(summary) > 200 else summary,
+    def _should_micro_compact(self, messages: list[Message]) -> bool:
+        tool_result_count = sum(1 for msg in messages if self._is_tool_result_message(msg))
+        if tool_result_count >= self.config.tool_history_compact_after_tool_calls:
+            return True
+
+        return any(
+            isinstance(msg.get("content", ""), str)
+            and len(msg.get("content", "")) > self.config.tool_result_limit
+            for msg in messages
         )
 
-        return new_messages
+    def _should_llm_compact(self, messages: list[Message], num_msgs: int, est_tokens: int) -> bool:
+        keep = max(0, int(self.config.compact_recent_messages))
+        if len(messages) <= 1 + keep:
+            return False
+
+        # retained_msgs = [msg for msg in messages[1:] if not self._is_history_summary_message(msg)]
+        if len(messages) <= keep:
+            return False
+
+        recent_msgs = messages[-keep:] if keep > 0 else []
+        old_msgs = messages[:-keep] if keep > 0 else messages
+
+        old_tokens = sum(len(str(m.get("content", ""))) // 4 for m in old_msgs)
+        recent_tokens = sum(len(str(m.get("content", ""))) // 4 for m in recent_msgs)
+
+        if num_msgs >= self.config.compact_after_messages:
+            return True
+        if est_tokens >= self.config.estimated_token_limit:
+            return True
+        if old_tokens >= self.config.compact_summary_limit:
+            return True
+        if old_tokens >= max(3000, self.config.estimated_token_limit * 0.6) and old_tokens >= 2 * max(1, recent_tokens):
+            return True
+
+        return False
+
+    def _is_tool_result_message(self, message: Message) -> bool:
+        content = message.get("content", "")
+        return (
+            message.get("role") == "user"
+            and isinstance(content, str)
+            and content.startswith("Tool `")
+            and "returned this JSON result:" in content
+        )
+
+    # def _is_history_summary_message(self, message: Message) -> bool:
+    #     return (
+    #         message.get("role") == "system"
+    #         and isinstance(message.get("content"), str)
+    #         and message["content"].startswith("[HISTORY SUMMARY]")
+    #     )

@@ -37,11 +37,11 @@ class ManualJsonProtocol:
             '{"type":"final","content":"final answer for the user"}\n'
             "\n"
             "Rules:\n"
-            "- Use tool_call when you need a tool.\n"
+            "- Carefully choose and Use tool_call when you need a tool.\n"
             "- Tool names must match the available tool docs exactly.\n"
             "- arguments must be a JSON object.\n"
             "- Use final only when you are done.\n"
-            "- If the user asks for a task-specific workflow, consult the skill docs first.\n"
+            "- If the user asks for a task-specific workflow, consult the skill docs first and VERY STRICTLY follow its instruction.\n"
             "- If a long-lived fact is needed, consult the memory docs and use memory tools as needed.\n"
             "\n"
             "Available tools:\n"
