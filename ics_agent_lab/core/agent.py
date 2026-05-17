@@ -152,14 +152,20 @@ class Agent:
         new_msgs = [messages[0]]
         tool_count = 0
         truncated_count = 0
+        preserve_recent_tool_results = max(0, int(self.config.compact_recent_messages))
         
         for msg in reversed(messages[1:]):
             content = msg.get("content", "")
             if self._is_tool_result_message(msg):
                 tool_count += 1
-                if tool_count > self.config.tool_history_compact_after_tool_calls and len(content) > 300:
+                should_preserve_recent = tool_count <= preserve_recent_tool_results
+                if (
+                    not should_preserve_recent
+                    and tool_count > self.config.tool_history_compact_after_tool_calls
+                    and len(content) > 600
+                ):
                     msg = msg.copy()
-                    msg["content"] = content[:200] + "... [Old tool output cleared to save context space]"
+                    msg["content"] = content[:500] + "... [Old tool output cleared to save context space]"
                     truncated_count += 1
             new_msgs.insert(1, msg)
 
