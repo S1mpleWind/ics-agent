@@ -22,13 +22,12 @@ class AgentConfig:
     compact_recent_messages: int = 5
     compact_summary_limit: int = 6000
     tool_result_limit: int = 5800
-    estimated_token_limit: int = 16000
-    llm_compact_high_water: int = 18000
-    llm_compact_low_water: int = 9800
-    llm_compact_cooldown_steps: int = 7
+    estimated_token_limit: int = 12000
+    llm_compact_high_water: int = 12000
+    llm_compact_low_water: int = 8500
+    llm_compact_cooldown_steps: int = 8
     # Non-LLM compaction options
-    use_non_llm_compact: bool = True
-    non_llm_compact_snippet_len: int = 200
+
 
 
 class Agent:
@@ -90,10 +89,7 @@ class Agent:
             if self._should_micro_compact(messages):
                 messages = self.micro_compact_tool_history(messages, est_tokens)
 
-            # if self._should_non_llm_compact(messages, num_msgs, est_tokens):
-            #     messages = self.compact_context_nonllm(messages, est_tokens)
-
-            if self._should_llm_compact(messages, num_msgs, est_tokens, step, last_llm_compact_step):
+            if self._should_compact(messages, num_msgs, est_tokens, step, last_llm_compact_step):
                 messages = self.compact_context(messages, est_tokens)
                 last_llm_compact_step = step
 
@@ -192,79 +188,92 @@ class Agent:
 
         return new_msgs
 
-    def compact_context(self, messages: list[Message], estimate:int) -> list[Message]:
-        #summary_char_limit = min(int(self.config.compact_summary_limit), max(2000, estimate * 2))
-
-        max_limit = int(min(self.config.compact_summary_limit,  0.3 * estimate))
-        min_limit = int(max(2000, estimate * 0.2))
-
+    def compact_context(self, messages: list[Message], estimate: int) -> list[Message]:
+        """
+        Deterministic, zero-LLM context compaction.
+        Preserves Thought -> Action -> Result chain, but heavily truncates payloads 
+        to keep the logical skeleton intact. Prevents hallucination while costing 0 API requests.
+        """
         keep = max(0, int(self.config.compact_recent_messages))
-        if len(messages) <= 1 + keep: return messages
-        # use a clean base system prompt string each time
-        system_prompt_content = self.protocol.build_system_prompt(
-                    self.tools.docs(), self.skill_docs, self.memory_docs)
-        
-        retained_msgs = messages
-
-        if len(retained_msgs) <= keep:
+        if len(messages) <= 1 + keep:
             return messages
 
-        if keep > 0:
-            recent_msgs = retained_msgs[-keep:]
-            old_msgs = retained_msgs[:-keep]
-        else:
-            recent_msgs = []
-            old_msgs = retained_msgs
-
-        def render(msg: Message) -> str:
-            return f"[{msg.get('role', '')}] {msg.get('content', '')}"
-
-        old_text = "\n\n".join(render(m) for m in old_msgs)
-        recent_text = "\n\n".join(render(m) for m in recent_msgs)
-
-        # Persistent archival (Tier 3)
-        # Search for any explicit 'save_memory' results in old_text to ensure they are indexed
-        # if "save_memory" in old_text and "ok\": true" in old_text:
-        #      # Logic to re-ensure key facts are archived if relevant
-        #      pass
-
-        instruct = (
-            "You are a summarize export who can summarize the agent context to specific length"
-            "Summarize the OLD conversation history as a structured factual list **Briefly and Precisely**.\n"
-            "You MUST preserve:\n"
-            "1. Current task goal — what the user originally asked for.\n"
-            "2. Key actions taken — tool calls made and their outcomes (OK/Error + critical return values).\n"
-            "3. Files and symbols touched — every file path, function name, and variable that was read or modified.\n"
-            "4. Decisions and constraints — any explicit choices made, requirements stated, or approaches ruled out.\n"
-            "5. Next step — what was about to happen or what remains to be done.\n"
-            "Use RECENT_CTX only to avoid repeating what is already there. Do not reproduce RECENT_CTX verbatim.\n"
-            f"**Ensure the length of summary is between {min_limit} and {max_limit}\n**"
+        system_prompt_content = self.protocol.build_system_prompt(
+            self.tools.docs(), self.skill_docs, self.memory_docs
         )
-        summary_messages = [
-            {"role": "system", "content": instruct},
-            {"role": "user", "content": f"OLD HISTORY:\n{old_text}\n\nRECENT_CTX:\n{recent_text}"}
-        ]
-        try:
-            summary = (self.llm.complete(summary_messages) or "").strip()
-            if len(summary) > max_limit:
-                summary = summary[:max_limit].rstrip() + "..."
-        except:
-            summary = "(summary failed)"
 
-        # incorporate the base system prompt into the summary and place the
-        # compressed summary at the beginning of a single system message.
+        retained_msgs = messages[1:]
+        recent_msgs = retained_msgs[-keep:] if keep > 0 else []
+        old_msgs = retained_msgs[:-keep] if keep > 0 else retained_msgs
+
+        history_lines = ["## Extracted Action Log (Oldest to Newest)"]
+        history_lines.append("This is a highly truncated log of previous actions to preserve your reasoning trace.\n")
+
+        for msg in old_msgs:
+            role = msg.get("role", "")
+            content = str(msg.get("content", "")).strip()
+
+            if role == "assistant":
+                parsed = None
+                idx = content.find("{")
+                if idx != -1:
+                    try:
+                        parsed = json.loads(content[idx:])
+                    except Exception:
+                        pass
+                
+                if isinstance(parsed, dict) and "kind" in parsed:
+                    thought = parsed.get("thought", parsed.get("reasoning", ""))
+                    if len(thought) > 300: thought = thought[:300] + "..."
+                    
+                    if thought:
+                        history_lines.append(f"- **Thought**: {thought}")
+                        
+                    kind = parsed.get("kind", "")
+                    if kind == "tool_call":
+                        name = parsed.get("name", "unknown")
+                        args = json.dumps(parsed.get("arguments", {}), ensure_ascii=False)
+                        if len(args) > 150: args = args[:147] + "..."
+                        history_lines.append(f"  **Action**: `{name}`({args})")
+                    elif kind == "final":
+                        history_lines.append(f"- **Final**: {parsed.get('content', '')[:100]}...")
+                else:
+                    history_lines.append(f"- **Agent**: {content[:100]}...")
+
+            elif role == "user":
+                if self._is_tool_result_message(msg):
+                    try:
+                        header, result_str = content.split("returned this JSON result:\n", 1)
+                        is_err = re.search(r"(?i)(error|failed|exception|traceback|timeout|not found)", result_str)
+                        if len(result_str) < 300:
+                            snippet = result_str
+                        else:
+                            if is_err:
+                                snippet = result_str[:150] + "\n  ... [truncated] ...\n  " + result_str[-250:]
+                            else:
+                                snippet = result_str[:150] + "\n  ... [truncated successful output]"
+                        
+                        snippet = snippet.replace("\n", "\n    ")
+                        history_lines.append(f"  **Result**: {snippet.strip()}")
+                    except Exception:
+                        history_lines.append(f"  **Result**: {content[:100]}...")
+                else:
+                    history_lines.append(f"- **User**: {content[:100]}...")
+
+        history_summary = "\n".join(history_lines)
+        limit = int(self.config.compact_summary_limit)
+        if len(history_summary) > limit:
+            history_summary = "...\n" + history_summary[-limit:]
+
         base_system = system_prompt_content
         if isinstance(base_system, str) and "[HISTORY SUMMARY]" in base_system:
-            # remove any prior summary block by keeping the tail after last marker
             base_system = base_system.split("[HISTORY SUMMARY]")[-1].lstrip()
 
-        new_system_content = f"[HISTORY SUMMARY]\n{summary}\n\n{base_system}"
-        new_system_msg = {"role": "system", "content": new_system_content}
-        new_messages = [new_system_msg] + recent_msgs
+        new_system_content = f"[HISTORY SUMMARY]\n{history_summary}\n\n{base_system}"
+        new_messages = [{"role": "system", "content": new_system_content}] + recent_msgs
 
-        self.trace.add(0, "context_compacted", agent=self.name, original_count=len(messages))
+        self.trace.add(0, "context_compacted_deterministic", agent=self.name, original_count=len(messages))
         return new_messages
-
 
     def _should_micro_compact(self, messages: list[Message]) -> bool:
         tool_result_count = sum(1 for msg in messages if self._is_tool_result_message(msg))
@@ -277,20 +286,7 @@ class Agent:
             for msg in messages
         )
 
-    def _should_non_llm_compact(self, messages: list[Message], num_msgs: int, est_tokens: int) -> bool:
-        if not getattr(self.config, "use_non_llm_compact", False):
-            return False
-
-        keep = max(0, int(self.config.compact_recent_messages))
-        if len(messages) <= 1 + keep:
-            return False
-
-        return (
-            num_msgs >= self.config.compact_after_messages
-            or est_tokens >= self.config.estimated_token_limit
-        )
-
-    def _should_llm_compact(
+    def _should_compact(
         self,
         messages: list[Message],
         num_msgs: int,
@@ -332,150 +328,3 @@ class Agent:
             and content.startswith("Tool `")
             and "returned this JSON result:" in content
         )
-    
-    #? some aborted functions
-
-    # def _is_history_summary_message(self, message: Message) -> bool:
-    #     return (
-    #         message.get("role") == "system"
-    #         and isinstance(message.get("content"), str)
-    #         and message["content"].startswith("[HISTORY SUMMARY]")
-    #     )
-
-
-    def compact_context_nonllm(self, messages: list[Message], estimate: int) -> list[Message]:
-        """Non-LLM compaction: deterministic, low-cost summarization that
-        extracts key IDs, paths, tool outputs, failures, evidence lines and
-        next-steps without calling an external model.
-        """
-        keep = max(0, int(self.config.compact_recent_messages))
-        if len(messages) <= 1 + keep:
-            return messages
-
-        # base system prompt (clean build)
-        system_msg = messages[0]
-        if isinstance(system_msg, dict):
-            base_system = system_msg.get("content", "")
-        else:
-            base_system = str(system_msg)
-
-        retained = messages[1:]
-        recent_msgs = retained[-keep:] if keep > 0 else []
-        old_msgs = retained[:-keep] if keep > 0 else retained
-
-        key_ids: set[str] = set()
-        paths: set[str] = set()
-        tool_summaries: list[dict[str, Any]] = []
-        failures: list[str] = []
-        evidences: list[str] = []
-        next_steps: list[str] = []
-
-        err_re = re.compile(r"error|failed|exception|traceback|timeout|denied|forbidden|\bok\":\s*false|status:\s*failed", re.I)
-        path_re = re.compile(r"(/[A-Za-z0-9_./\-]+)")
-        id_re = re.compile(r"\b[A-Za-z0-9_-]{8,}\b")
-        next_re = re.compile(r"\b(next steps?|todo|plan|follow up)\b", re.I)
-
-        snippet_len = int(self.config.non_llm_compact_snippet_len)
-
-        for msg in old_msgs:
-            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-            role = msg.get("role", "") if isinstance(msg, dict) else ""
-
-            if self._is_tool_result_message(msg):
-                # try to extract JSON payload from the text
-                parsed = None
-                idx = content.find("{")
-                if idx != -1:
-                    candidate = content[idx:]
-                    try:
-                        parsed = json.loads(candidate)
-                    except Exception:
-                        parsed = None
-
-                info: dict[str, Any] = {
-                    "role": role,
-                    "size": len(content),
-                    "snippet_head": content[:snippet_len],
-                    "snippet_tail": content[-snippet_len:],
-                }
-                if isinstance(parsed, dict):
-                    info["keys"] = list(parsed.keys())[:10]
-                    if "key" in parsed and isinstance(parsed["key"], str):
-                        key_ids.add(parsed["key"])
-                    info["ok"] = parsed.get("ok")
-                tool_summaries.append(info)
-                # evidence may include status-like fields
-                if parsed and isinstance(parsed, dict):
-                    for k, v in parsed.items():
-                        if isinstance(v, str) and len(v) > 0 and path_re.search(v):
-                            paths.add(v)
-
-            else:
-                # free text: scan for failures, paths, ids, next-steps
-                lines = [ln.strip() for ln in str(content).splitlines() if ln.strip()]
-                matched_flag = False
-                for ln in lines:
-                    if err_re.search(ln):
-                        failures.append(ln)
-                        evidences.append(ln)
-                        matched_flag = True
-                    for m in path_re.findall(ln):
-                        paths.add(m)
-                    for iid in id_re.findall(ln):
-                        key_ids.add(iid)
-                    if next_re.search(ln):
-                        next_steps.append(ln)
-                        matched_flag = True
-                if not matched_flag and lines:
-                    # keep a small snippet as evidence
-                    evidences.append(lines[0][:snippet_len])
-
-        parts: list[str] = []
-        # Goal: prefer the first non-empty line of the base system prompt
-        goal = (base_system or "").splitlines()
-        if goal:
-            first_goal = goal[0].strip()
-            if first_goal:
-                parts.append("GOAL: " + first_goal)
-
-        if key_ids:
-            parts.append("KEY_IDS: " + ", ".join(list(key_ids)[:20]))
-        if paths:
-            parts.append("PATHS: " + ", ".join(list(paths)[:20]))
-
-        if failures:
-            parts.append("FAILURES:")
-            for f in failures[:20]:
-                parts.append("- " + f)
-
-        if tool_summaries:
-            parts.append("TOOL_OUTPUTS:")
-            for t in tool_summaries[:50]:
-                keys = t.get("keys") or []
-                parts.append(
-                    "- size={size}, keys={keys}, head={head}...".format(
-                        size=t.get("size"), keys=keys, head=t.get("snippet_head", "")[:120]
-                    )
-                )
-
-        if evidences:
-            parts.append("EVIDENCE:")
-            for e in evidences[:50]:
-                parts.append("- " + e)
-
-        if next_steps:
-            parts.append("NEXT_STEPS:")
-            for n in next_steps[:20]:
-                parts.append("- " + n)
-
-        summary = "\n".join(parts).strip()
-        limit = int(self.config.compact_summary_limit)
-        if len(summary) > limit:
-            summary = summary[: max(0, limit - 3)] + "..."
-
-        new_system_content = "[HISTORY SUMMARY]\n" + summary + "\n\n" + base_system
-        new_system_msg = {"role": "system", "content": new_system_content}
-        new_messages = [new_system_msg] + recent_msgs
-
-        self.trace.add(0, "context_compacted_nonllm", agent=self.name, original_count=len(messages), retained_recent=len(recent_msgs))
-        return new_messages
