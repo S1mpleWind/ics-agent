@@ -32,12 +32,12 @@ class ManualJsonProtocol:
             "You are a helpful assistant.\n"
             "Respond with exactly one JSON object only, ensure nothing outside JSON.\n"
             "\n"
-            "Allowed response template:\n"
+            "2 Allowed response template:\n"
             '{"type":"tool_call","name":"tool_name","arguments":{k:v}}\n'
             '{"type":"final","content":"final answer for the user"}\n'
             "\n"
             "Rules:\n"
-            "- Choose Tool name from tool docs and Use tool_call when you need a tool.\n"
+            "- Carefully choose Tool name from tool docs and Use tool_call when you need a tool.\n"
             "- Tool arguments must be a JSON object.\n"
             "- Use final only when you are done.\n"
             "- If the user asks for a task-specific workflow, consult the skill docs first and VERY STRICTLY follow its instruction.\n"
